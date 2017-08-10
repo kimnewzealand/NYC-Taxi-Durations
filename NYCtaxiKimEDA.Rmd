@@ -1,0 +1,274 @@
+---
+title: "NYC Taxi Duration Exploratory Data Analysis"
+author: "kimnewzealand"
+date: "9 August 2017"
+output:
+  html_document:
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+  pdf_document: default
+---
+
+## SYNOPSIS
+
+The New York City Taxi Trip Duration  [Kaggle competition](https://www.kaggle.com/c/nyc-taxi-trip-duration) launched on 21 July 2017 is a competition given train and test data sets, with the objective of predicting trip durations.
+
+This is an Exploratory Data Analysis prior to the Data Modelling and Predictions which will be reported in a separate document.  
+
+We will use different methods for our analysis to enable us to have different views of the data and compare the results. We will also use different techniques for dealing with large datasets such as data.table  and random row sampling.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE)
+```
+
+## Setup
+
+### Load Libraries
+```{r load packages, results = 'asis'}
+library(data.table)
+library(knitr)
+library(ggplot2)
+library(GGally)
+library(ggmap)
+library(maps)
+library(mapdata)
+library(mapview)
+library(leaflet)
+library(dplyr)
+library(taRifx)
+```
+* * *
+
+## Part 1: Data
+
+### 1.1. Load Data
+
+The first step will be to load the data description, test and train data file using the fread function from the R package data.table. 
+
+```{r loaddata, include=FALSE,showProgress=FALSE}
+# Load the datasets using the fread function from the data.table library.
+setwd("~/Kaggle/Taxi")
+train <- fread("./train.csv")
+test <- fread("./test.csv")
+```
+
+### 1.2 Data Structure and Summary
+
+- There are `r dim(train)[1]` rows with `r dim(train)[2]` variables in train.   
+- There are `r dim(test)[1]` rows with `r dim(test)[2]` variables in test. 
+
+Train has two additional fields _trip_duration_ and dropoff_datetime to the test set. The variable _trip_duration_ is the independent, response  variable we are trying to predict and is derived as the difference between dropoff_datetime and pickup_datetime.
+
+Each row in the datasets represent one taxi trip.
+
+All variable headings are populated.
+
+```{r summarytrain}
+# Summary statistics
+kable(summary(train)[,1:5])
+kable(summary(train)[,6:11])
+```
+
+We can expand on the data field information provided by Kaggle with the above summary information:
+
+**EXPLANATORY VARIABLES/ FEATURES**  
+- **id**  `r class(train$id)`. A unique identifier for each trip.   
+- **vendor_id** `r class(train$vendor_id)`. A code indicating the provider associated with the trip record. There appears to be `r max(train$vendor_id)` taxi companies.  
+- **pickup_datetime** `r class(train$pickup_datetime)`. The date and time when the meter was engaged. This is currently a combination of date and time.  
+- **dropoff_datetime** `r class(train$dropoff_datetime)`. The date and time when the meter was disengaged. As above this is a combination of date and time.  
+- **passenger_count** `r class(train$passenger_count)`. The number of passengers in the vehicle (driver entered value). This is a count from up to `r max(train$passenger_count)`.  
+- **pickup_longitude** `r class(train$pickup_longitude)`. The longitude where the meter was engaged. These are geographical coordinates and appear to be in the correct format.  
+- **pickup_latitude** `r class(train$pickup_latitude)`. The latitude where the meter was engaged.  
+- **dropoff_longitude** `r class(train$dropoff_longitude)`. The longitude where the meter was disengaged.  
+- **dropoff_latitude** `r class(train$dropoff_latitude)`. The latitude where the meter was disengaged.  
+- **store_and_fwd_flag** `r class(train$store_and_fwd_flag)`. This flag indicates whether the trip record was held in vehicle memory before sending to the vendor because the vehicle did not have a connection to the server. Y=store and forward; N=not a store and forward trip.   
+
+**RESPONSE VARIABLE/ OUTCOME**  
+- **trip_duration** `r class(train$trip_duration)`. The duration of the trip in seconds.   
+
+### 1.3. Missing Values
+
+There are `r mean(is.na(train))` NA missing values in the dataset.
+
+### 1.4. Sample Train Data
+
+Since this is a large dataset we will use a random sample of rows for EDA plots.
+
+```{r}
+# Convert variables to factor and numeric classes for EDA
+train$vendor_id <-as.factor(train$vendor_id)
+train$passenger_count <-as.factor(train$passenger_count)
+train$trip_duration <-as.numeric(train$trip_duration)
+train$store_and_fwd_flag <-as.factor(train$store_and_fwd_flag)
+
+# Random sample subset of train data for EDA, set seed to be reproduceable
+set.seed(123)
+trainsample <- sample_n(train, 10000)
+testsample <- sample_n(test, 10000)
+```
+* * *
+
+## Part 2: Exploratory Data Analysis
+
+### 2.1. Plots of Categorical Variables
+
+Let's first take a look at the plots between the categorical variables and the _trip_duration_  using ggpairs function from the R package GGally. 
+
+```{r catplots}
+# Plot sample train data
+ggpairs(trainsample[,c("vendor_id", "passenger_count", "store_and_fwd_flag","trip_duration")], upper = list(continuous = "points", combo = "box"), lower = list(continuous = "points", combo = "box"))
+```
+
+Let's review each of the variables in turn:
+
+2.1.1 RESPONSE VARIABLE TRIP_DURATION
+
+The variable trip_duration is right skewed with very long tail. We will therefore take the log to normalise the distribution. Let's check the new plot:
+
+```{r durplot, fig.height=4,fig.width=4}
+# Add a column of log of the duration 
+train <-  train %>%
+    mutate(logduration=log(trip_duration+1))
+# Plot the  log duration for comparison
+g <- ggplot(data=train,aes(logduration))
+g + geom_histogram(col="pink",bins=100) + 
+    labs(title="Histogram of Trip Duration")
+```
+
+The log of the trip_duration is normally distributed, although with a high peak. If we use this form of the response variable in the data modelling, we will need to remember convert the log trip duration back to original form later. 
+
+There appear to be some outliers in _trip_duration_, with the max value `r max(train$trip_duration)` which equates to `r round(max(train$trip_duration)/60/60/24)` days. We make the assumption that the meter has to be actively disengaged, there may be trips where the driver forgot to turn off the meter on drop off. 
+
+2.1.2 PASSENGER COUNT
+
+The passenger count is a right skewed distribution, which we could expect: most cab rides have single or few passengers. [Offical NY Taxis](http://www.nyc.gov/html/tlc/html/faq/faq_pass.shtml#3) can take a maximum of 5 passengers. 
+
+```{r summary}
+kable(summary(train$passenger_count),format="html")
+```
+
+We may want to look into the largest taxi cab size by taxi company to validate the number of passengers range.
+
+[Official NY taxis](http://www.nyc.gov/html/tlc/html/faq/faq_pass.shtml) can take up to 5 passengers  however there are [NYC limo companies](https://nyclimousine.com/) that take up to 10 passengers. Therefore we will leave the passenger number variable unchanged as we do not know the names of the vendors in this dataset.
+
+Let's view the passenger numbers against _trip_duration_ and split by the vendor id in a boxplot.
+
+```{r passbox, fig.height=4,fig.width=4}
+g <- ggplot(train,aes(as.factor(passenger_count), trip_duration, color = passenger_count))
+g +  geom_boxplot() +
+    scale_y_log10() +
+    theme(legend.position = "none") +
+    facet_wrap(~ vendor_id) +
+    labs(title = "Trip Duration by Number of Passengers", x = "Number of passengers",y= "Trip duration (s)")
+```
+  
+From the plots there appears to be some correlation between the passenger count and trip duration for vendor 1.
+We can also see 0 passenger number taxi trips?! We may want to remove these from our model training.
+
+2.1.3 STORE AND FORWARD FLAG
+
+From the above ggpairs plot there appears to little correlation between store_and_fwd_flag and the _trip duration_ but there may be a relationship to vendor_id outliers. 
+
+2.1.4 VENDOR ID
+
+From the above plot there appears to be little correlation between vendor_id and the _trip duration_ although  vendor id 2 is responsible for the outliers.
+
+### 2.2. Plots of Numerical Variables
+
+We will only be analysing the pickup datetime variable not the drop off datetime variable as this is not in the test dataset, and we will likely remove the dropoff_datetime from our training set.
+
+The other numerical features are the pickup and dropoff longitude and latitude variables are geographical coordinates. 
+
+2.2.1. PICKUP_DATETIME
+
+Let's also take a look at the pickup_datetime variable against the trip_duration, colour coded by the vendor_id.
+
+```{r timeseriesplots, fig.height=4,fig.width=4}
+# Convert the datetime variables with class POSIXct
+train$pickup_datetime <- as.POSIXct(train$pickup_datetime)
+# ScatterPlot the pick up date and time against trip_duration on trainsample
+g <- ggplot(trainsample, aes(pickup_datetime,trip_duration,colour=vendor_id)) 
+g + geom_point() +
+    labs(title = "Pickup dates and time and Trip Duration",x="Pick up date and time",y="Trip duration (seconds)")
+```
+  
+Based on this plot there appear to be outliers scattered above a threshold 10,000 second duration by vendor 2. 
+
+2.2.2. PICKUP_LATITUDE AND PICKUP_LONGITUDE
+
+2.2.2.1. Produce map using ggpairs
+
+We will first take a look a ggpairs plot for any outliers then look at some of the location coordinates using maps.
+
+```{r coordggpairs}
+# Plot a subset of train pickup and drop off date and times
+ggpairs(trainsample %>% select(pickup_longitude,pickup_latitude,dropoff_longitude,dropoff_latitude,trip_duration)) 
+```
+
+There are some longitude and latitude outliers outside of the New York area.
+
+The _trip_duration_ are reasonably short except for groups of longitudes and latitudes above a threshold of 10,000 seconds. 
+
+Since 24 hours is 86,400 seconds  there may be a reset on the taxi meters to explain this threshold. We may want to exclude _trip_duration_ above this threshold in the modeling.
+ 
+2.2.2.2. Produce map using function map_data function from ggplot2
+```{r numplots2}
+# Create a smaller dataframe for EDA plotting since this is a very large dataset, that will work with ggplot2 and function map_data function from ggplot2
+maptrain <- trainsample[,6:9]
+maptrain<- maptrain %>%
+    mutate(group =1)
+order<-as.data.frame(c(1:dim(maptrain)[1]))
+names(order)<-"order"
+maptrain<- cbind(maptrain,order)
+maptrain<- maptrain %>%
+  mutate(region ="USA")
+maptrainpick <-maptrain[,-(3:4)]
+maptraindrop <-maptrain[,-(1:2)]
+usa <- map_data("usa")
+# Plot using ggplot
+ggplot() + 
+    geom_polygon(data = usa, aes(x=long, y = lat, group = group), color = "grey30", alpha = 0.6, size = 0.3) +  
+    coord_fixed(xlim = c(-74.5, -73.5), ylim = c(40.4,41.4)) + 
+    geom_point(data = maptrainpick, aes(x = pickup_longitude, y = pickup_latitude), color = "black", size = 1) +
+    geom_point(data = maptraindrop, aes(x = dropoff_longitude, y = dropoff_latitude), color = "yellow", size = 1) + 
+    ggtitle("Taxi Pick ups (black) and Drop offs (yellow)")
+```
+
+2.2.2.3. Produce map using ggmap
+
+Next we will take a look at mapping New York using the R package ggmap.
+```{r ggmap}
+# Create a base map of New York City
+nymap <- get_map(location = "New York", maptype = "roadmap", zoom = 11)
+g <- ggmap(nymap) 
+# Add coordinates from train as layers to the base plot
+g + theme_void() + 
+    ggtitle("Taxi Pick ups (black) and Drop offs (yellow)")+
+    geom_point(data = trainsample, aes(x = pickup_longitude, y = pickup_latitude), color = "black", size = 1) +
+    geom_point(data = trainsample, aes(x = dropoff_longitude, y = dropoff_latitude), color = "yellow", size = 1) + 
+    theme_void() 
+```
+
+2.2.2.4. Produce map using leaflet
+
+Lastly let's view using the R package leaflet to produce an interactive map of New York City plotting the pick up and drop off coordinates. This will allow us to get an idea of the coordinates of the different areas and airports in New York.
+```{r leaflet trainsample}
+# Plot the pickup locations and the drop off locations
+map1 <- leaflet(trainsample) %>% # initiate the leaflet instance
+    addTiles() %>%  #add map tiles - the default is openstreetmap
+    setView(-73.9, 40.75, zoom = 11) %>% 
+    addCircles(~pickup_longitude, ~pickup_latitude, weight = 1, radius=10, 
+                 color="red", stroke = TRUE, fillOpacity = 0.8) %>%
+    addCircles(~dropoff_longitude, ~dropoff_latitude, weight = 1, radius=10, 
+                 color="blue", stroke = TRUE, fillOpacity = 0.8) %>% 
+    addLegend("bottomright", colors= "blue", labels="Drop off Location in TRain data", title="In New York City") %>%
+    addLegend("topright", colors= "red", labels="Pick up Location Train data", title="In New York City") %>%
+    addMouseCoordinates(style = "basic")
+map1
+```
+
+
+
+
