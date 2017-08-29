@@ -498,8 +498,7 @@ Using the inbuilt xgb.cv function for k-fold cross validation, let's calculate t
                  maximize = F,
                  verbose=0)
 #  nround best iteration is:
- bestiteration <- xgbcv$best_iteration
-bestiteration <-400
+bestiteration <- xgbcv$best_iteration
 # xgbcv gblinear minimum train RMSE mean
  min(xgbcv$evaluation_log$train_rmse_mean)
 # xgbcv gblinear minimum test RMSE mean
