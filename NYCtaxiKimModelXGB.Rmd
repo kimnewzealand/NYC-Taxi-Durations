@@ -1,0 +1,639 @@
+---
+title: "NYC Taxi Duration Machine Learning - XGBoost"
+author: "kimnewzealand"
+date: "28 August 2017"
+output:
+  html_document:
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+  pdf_document: default
+---
+
+## Background
+
+The New York City Taxi Trip Duration Kaggle competition launched on 21 July 2017 is a competition given train and test data sets, with the objective of predicting taxi trip durations.
+
+This is the first time I have used an XGBoost algorithm in practice for machine learning. This file has been distilled from the many great tutorials available online, to create a reusable base template for future machine learning projects. 
+These resources have been particularly useful:
+
+[Distributed (Deep) Machine Learning Community](https://github.com/dmlc/xgboost/blob/master/R-package/vignettes/xgboostPresentation.Rmd)
+[Offical XGBoost](https://xgboost.readthedocs.io/en/latest/)
+[Machinelearningmastery](https://machinelearningmastery.com/gentle-introduction-xgboost-applied-machine-learning/)
+
+This data modelling and prediction, is based on an Exploratory Data Analysis which will be reported in a separated html document, NYCtaxiKimEDA.html.
+
+Additionally, since these are relatively large datasets, we will use different packages for dealing with large datasets including data.table and parallel and doParallel R packages.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache =TRUE, warning=FALSE)
+```
+
+* * *
+
+### Part 1:  Setup
+
+## Load packages
+
+Load the R packages required.
+
+```{r load packages,results='asis', echo=FALSE, include=FALSE}
+library(data.table)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(GGally)
+library(lubridate)
+library(Matrix)
+library(taRifx)
+library(caret)
+library(xgboost)
+library(parallel)
+library(doParallel)
+library(parallelMap)
+```
+
+
+## Load Data
+
+The first step will be to load the data description, test data file and train data file. These have been downloaded to a local Kaggle folder offline.
+
+We will use the data.table R package designed for large datasets.
+
+```{r loaddata,include =FALSE}
+## Using fread from data.table package to load work with large datasets
+setwd("~/Kaggle/Taxi")
+train <- fread("./train.csv")
+test <- fread("./test.csv")
+```
+* * *
+
+### Part 2: Data Cleaning
+
+Let's clean the train and test datasets variable by variable based on the exploratory data analysis. 
+
+Note there are no missing values in the dataset to impute. 
+
+2.1 *vendor_id* and *store_and_fwd_flag*
+```{r numconvert}
+# Convert integer variables to numeric for both train and test sets to run XGBoost
+train <- japply( train, which(sapply(train, class)=="integer"), as.numeric )
+test <- japply( test, which(sapply(test, class)=="integer"), as.numeric )
+```
+
+2.2 *pickup_datetime* and *dropoff_datetime*
+```{r datetime}
+# Convert the pickup datetime into POSIXct for both train and test sets
+train$pickup_datetime <- as.POSIXct(train$pickup_datetime)
+test$pickup_datetime <- as.POSIXct(test$pickup_datetime)
+# We will remove the dropoff_datetime from the dataset, so this does not need to be converted anymore.
+# train$dropoff_datetime <- as.POSIXct(train$dropoff_datetime)
+# test$dropoff_datetime <- as.POSIXct(test$dropoff_datetime)
+```
+
+2.3 *passenger_count*
+```{r passclean}
+# Remove 0 passenger rides, but don't filter rows from test file as this will change the length for predictive purposes.
+train <- train  %>%
+  filter(passenger_count > 0)
+```
+
+2.4 *pickup_longitude* *pickup_latitude*  *dropoff_longitude* *dropoff_latitude*
+```{r stateoutlier}
+# Remove geospatial outliers not in  NY and NJ State coordinates
+usa <- map_data("usa")
+states <- map_data("state")
+nystate<- states[states$region=="new york",]
+njstate<- states[states$region=="new jersey",]
+# Take a look at the longitude and latitude range for New York State
+kable(summary(nystate))
+kable(summary(njstate))
+# List the subregions in New York state
+table(nystate$subregion)
+# Remove data not in New York and New Jersey state based on the NY and NJ max and min long and lat coordinates. Again, don't filter test file.
+train <- train  %>%
+  filter(pickup_longitude<=-71.88) %>%
+  filter(pickup_longitude>=-79.77) %>%
+  filter(dropoff_longitude>=-79.77) %>%
+  filter(dropoff_longitude<=-71.88) 
+train <- train %>%
+  filter(pickup_latitude<=45.01) %>%
+  filter(pickup_latitude>=38.93) %>%
+  filter(dropoff_latitude>=38.93) %>%
+  filter(dropoff_latitude<=45.01)
+
+# Check that the range of the long coordinates are between -71.88 and -79.77 and the lat coordinates are between 38.93 and 45.01
+kable(summary(train))
+kable(summary(test))
+
+# Clear memory of the map_data dataframes as these wil no longer be needed
+rm(nystate)
+rm(njstate)
+rm(states)
+rm(usa)
+```
+
+2.5 *trip_duration*
+
+To explain the outliers with very high durations, we will make the assumption that the meter was not disengaged on drop off for some rides.  Visually it appears to be cut off at 24 hours from the EDA. 
+
+Also from the EDA there seem to be a blanket of observations around 3 hours. We will remove the outliers in the durations using a cut off of 10,800 or 3 hours.
+
+```{r durclean}
+# Remove very long durations
+train <- train  %>%
+  filter(trip_duration < 10800) 
+```
+
+We will also add a column to train for the log of the _trip_duration_, logduration, to be used as the response variable in the model.
+```{r logduration}
+# The log of the duration is normally distributed. We will need to convert the 
+# predicted trip duration back to original form later.Add log duration to dataset
+train <-  train %>%
+  mutate(logduration=log(trip_duration+1))
+```
+
+Let's quickly revisualise a sample of our cleaned train dataset using ggpairs plots from the ggplot2 R package:
+
+```{r trainsample}
+# Random subset of train data
+set.seed(123)
+trainsample <- sample_n(train, 10000)
+```
+
+```{r catggpairs}
+# Plot train data categorical variables
+ggpairs(trainsample[,c("vendor_id", "passenger_count", "store_and_fwd_flag","trip_duration","logduration")], upper = list(continuous = "points", combo = "box"), lower = list(continuous = "points", combo = "box"))
+```
+
+```{r numggpairs}
+# Plot train data numerical variables
+ggpairs(trainsample %>% select(pickup_longitude,pickup_latitude,dropoff_longitude,dropoff_latitude,logduration,trip_duration))
+```
+The outliers have been removed and longitudes and latitudes look more evenly distributed against the durations.
+
+* * *
+
+## Part 3: Modeling
+
+3.1. **MODEL SELECTION**
+
+Since we know the outcome continuous variable, we will use a supervised machine learning algorithm. It also appears from our EDA that we will potentially need a non-linear regression model.  The algorithm that we will use is XGBoost where we can choose between the two booster methods. Here we will only use default XGBoost parameters and perform some initial feature engineering.
+
+We will use RMSE as our metric and ultimately select the final model based on the lowest RMSE.
+
+
+In R, the XGBoost package uses the following:
+
+- A matrix of input data instead of a data frame. 
+
+- Only numeric variables.
+
+- The target variable separately, which we will code to y.
+
+
+We will convert the categorical variables into dummy variables using one hot encoding.  It is recommended by the R package XGBoost's vignette to use  xgb.DMatrix, which its own class.
+
+3.2. **PREPROCESSING**
+
+For our preproccesing, we will be using the caret and dplyr R packages.
+
+3.2.1 Remove near zero variances
+```{r}
+# Look for near zero variance covariates to eliminate from dataset. We do not need to run for XGBoost.
+# nsv <- nearZeroVar(train,saveMetrics = TRUE)
+# kable(nsv[nsv$nzv==TRUE,])
+
+# Remove near zero variance variables
+# train <- train %>%  
+#   dplyr::select(-starts_with("store_and_fwd_flag"))
+ 
+ # Apply to the test set
+# test <- test %>%  
+# dplyr::select(-starts_with("store_and_fwd_flag"))
+```
+
+3.2.2 PreProcess with caret
+
+We can review the preprocess function results from caret package.
+
+```{r}
+# preProcess center and scaled, and ignored. We do not need to run for XGBoost.
+# preProc <- preProcess(train,method=c('center','scale'))
+# Print out the preprocessed dataframe results
+# preProc
+```
+
+
+3.3. **FEATURE ENGINEERING**
+
+3.3.1 Date and Time
+
+For the first part of the feature engineering, we will take a look at engineering the date and time variables into smaller components.
+
+```{r convdatetime}
+# Convert the datetime variables into separate date and time variables with class POSIXct. Using dplyr R package functions and isoweek from the R package lubridate
+train <-  train %>%
+  dplyr::mutate(pickup_wday= wday(pickup_datetime)) %>%
+  dplyr::mutate(pickup_hour= as.numeric(hour(pickup_datetime))) %>%
+  dplyr::mutate(pickup_minute= as.numeric(minute(pickup_datetime))) %>%
+  dplyr::mutate(pickup_month= month(pickup_datetime)) %>%
+  dplyr::mutate(pickup_weekofyear= lubridate::isoweek(pickup_datetime)) %>%
+  dplyr::mutate(pickup_weekhour= pickup_wday*24+pickup_hour)
+
+test <-  test %>%
+  dplyr::mutate(pickup_wday= wday(pickup_datetime)) %>%
+  dplyr::mutate(pickup_hour= as.numeric(hour(pickup_datetime))) %>%
+  dplyr::mutate(pickup_minute= as.numeric(minute(pickup_datetime))) %>%
+  dplyr::mutate(pickup_month= month(pickup_datetime)) %>%
+  dplyr::mutate(pickup_weekofyear= lubridate::isoweek(pickup_datetime)) %>%
+  dplyr::mutate(pickup_weekhour= pickup_wday*24+pickup_hour)
+```
+
+```{r rushhour}
+# Convert the datetime variables into the weekday, hour and month and rush hour categorical features. 
+train <-  train  %>%
+  mutate(latehour= ifelse(pickup_hour>20,"Yes",ifelse(pickup_hour<6,"Yes","No")))  %>%  #daily 50-cent surcharge from 8pm to 6am.
+    mutate(pmrushhour=ifelse(pickup_wday %in% c(1,2),"No", ifelse(pickup_hour<16,"No",ifelse(pickup_hour>20,"No","Yes")))) # $1 surcharge from 4pm to 8pm on weekdays, excluding holidays.
+    
+test <-  test   %>%
+ mutate(latehour= ifelse(pickup_hour>20,"Yes",ifelse(pickup_hour<6,"Yes","No")))  %>%  # daily 50-cent surcharge from 8pm to 6am.
+    mutate(pmrushhour=ifelse(pickup_wday %in% c(1,2),"No", ifelse(pickup_hour<16,"No",ifelse(pickup_hour>20,"No","Yes")))) # $1 surcharge 
+# from 4pm to 8pm on weekdays, excluding holidays.
+```
+ 
+3.3.2 Pick up and Drop Location Features
+
+```{r airport}
+# Add Airport  pickup / drop off features
+la_guardia_lon = -73.872611
+la_guardia_lat = 40.77725
+jfk_lon = -73.778889
+jfk_lat = 40.639722
+nw_lon = -73.179
+nw_lat = 40.669385
+
+# Set a radius for the airport locations
+airport_radius <- 0.03 
+airport_radius_lg <- 0.01 
+
+test <- test %>%
+  mutate(lga_pickup = ifelse(pickup_longitude >= la_guardia_lon - airport_radius_lg & 
+                  pickup_longitude <= la_guardia_lon + airport_radius_lg & 
+                  pickup_latitude >= la_guardia_lat - airport_radius_lg & 
+                  pickup_latitude <= la_guardia_lat + airport_radius_lg, 1, 0))
+
+train <- train %>%
+  mutate(lga_pickup = ifelse(pickup_longitude >= la_guardia_lon - airport_radius_lg &  
+                  pickup_longitude <= la_guardia_lon + airport_radius_lg &  
+                  pickup_latitude >= la_guardia_lat - airport_radius_lg & 
+                  pickup_latitude <= la_guardia_lat + airport_radius_lg, 1, 0))
+
+test <- test %>%
+  mutate(lga_dropoff = ifelse(dropoff_longitude >= la_guardia_lon - airport_radius_lg &   
+                  dropoff_longitude <= la_guardia_lon + airport_radius_lg & 
+                  dropoff_latitude >= la_guardia_lat - airport_radius_lg &  
+                  dropoff_latitude <= la_guardia_lat + airport_radius_lg, 1, 0))
+
+train <- train %>%
+  mutate(lga_dropoff = ifelse(dropoff_longitude >= la_guardia_lon - airport_radius_lg & 
+                  dropoff_longitude <= la_guardia_lon + airport_radius_lg &
+                  dropoff_latitude >= la_guardia_lat - airport_radius_lg & 
+                  dropoff_latitude <= la_guardia_lat + airport_radius_lg, 1, 0))
+
+test <- test %>%
+  mutate(jfk_pickup = ifelse(pickup_longitude >= jfk_lon - airport_radius &
+                  pickup_longitude <= jfk_lon + airport_radius &
+                  pickup_latitude >= jfk_lat - airport_radius &
+                  pickup_latitude <= jfk_lat + airport_radius, 1, 0))
+
+train <- train %>%
+  mutate(jfk_pickup = ifelse(pickup_longitude >= jfk_lon - airport_radius &
+                  pickup_longitude <= jfk_lon + airport_radius &
+                  pickup_latitude >= jfk_lat - airport_radius &
+                  pickup_latitude <= jfk_lat + airport_radius, 1, 0))
+
+test <- test %>%
+  mutate(jfk_dropoff = ifelse(dropoff_longitude >= jfk_lon - airport_radius &
+                  dropoff_longitude <= jfk_lon + airport_radius &
+                  dropoff_latitude >= jfk_lat - airport_radius &
+                  dropoff_latitude <= jfk_lat + airport_radius, 1, 0))
+
+train <- train %>%
+  mutate(jfk_dropoff = ifelse(dropoff_longitude >= jfk_lon - airport_radius &
+                  dropoff_longitude <= jfk_lon + airport_radius &
+                  dropoff_latitude >= jfk_lat - airport_radius &
+                  dropoff_latitude <= jfk_lat + airport_radius, 1, 0))
+
+test <- test %>%
+  mutate(nw_pickup = ifelse(pickup_longitude >= nw_lon - airport_radius &
+                  pickup_longitude <= nw_lon + airport_radius &
+                  pickup_latitude >= nw_lat - airport_radius &
+                  pickup_latitude <= nw_lat + airport_radius, 1, 0))
+
+train <- train %>%
+  mutate(nw_pickup = ifelse(pickup_longitude >= nw_lon - airport_radius &
+                  pickup_longitude <= nw_lon + airport_radius &
+                  pickup_latitude >= nw_lat - airport_radius &
+                  pickup_latitude <= nw_lat + airport_radius, 1, 0))
+
+test <- test %>%
+  mutate(nw_dropoff = ifelse(dropoff_longitude >= nw_lon - airport_radius &
+                  dropoff_longitude <= nw_lon + airport_radius &
+                  dropoff_latitude >= nw_lat - airport_radius &
+                  dropoff_latitude <= nw_lat + airport_radius, 1, 0))
+
+train <- train %>%
+  mutate(nw_dropoff = ifelse(dropoff_longitude >= nw_lon - airport_radius &
+                  dropoff_longitude <= nw_lon + airport_radius &
+                  dropoff_latitude >= nw_lat - airport_radius &
+                  dropoff_latitude <= nw_lat + airport_radius, 1, 0))
+
+train$jfk_trip <- ifelse(train$jfk_pickup | train$jfk_dropoff, 1, 0)
+train$lga_trip <- ifelse(train$lga_pickup | train$lga_dropoff, 1, 0)
+train$nw_trip <- ifelse(train$nw_pickup | train$nw_dropoff, 1, 0)
+
+test$jfk_trip <- ifelse(test$jfk_pickup | test$jfk_dropoff, 1, 0)
+test$lga_trip <- ifelse(test$lga_pickup | test$lga_dropoff, 1, 0)
+test$nw_trip <- ifelse(test$nw_pickup | test$nw_dropoff, 1, 0)
+```
+
+3.3.3. Filter out the predictor variables that are not useful
+
+```{r removeIDvariables}
+# Remove the identifier variables that do not have predictive value, in train and test sets
+train <- train %>% 
+  dplyr::select(-starts_with("Id"))  %>% 
+  dplyr::select(-starts_with("dropoff_datetime"))  %>% 
+  dplyr::select(-starts_with("pickup_datetime")) 
+
+test_id <- test %>% 
+  dplyr::select(id)
+
+test <- test %>% 
+  dplyr::select(-starts_with("Id")) %>% 
+  dplyr::select(-starts_with("dropoff_datetime"))%>% 
+  dplyr::select(-starts_with("pickup_datetime")) 
+```
+
+3.3.4. Numerical Variables for XGBoost
+
+```{r}
+# Convert integer  to numerical variables for both train and test sets in order to run XGBoost
+train <-  train %>%
+  dplyr::mutate(store_and_fwd_flag= as.numeric(store_and_fwd_flag)) %>%
+  dplyr::mutate(latehour= as.numeric(latehour)) %>%
+  dplyr::mutate(pmrushhour= as.numeric(pmrushhour)) 
+
+test <-  test %>%
+  dplyr::mutate(store_and_fwd_flag= as.numeric(store_and_fwd_flag)) %>%
+  dplyr::mutate(latehour= as.numeric(latehour)) %>%
+  dplyr::mutate(pmrushhour= as.numeric(pmrushhour))
+```
+
+
+3.4. **DATA SPLITTING**
+
+```{r datasplit}
+# Set seed to ensure reproduceability on the data split
+set.seed(222)
+# Use the caret package to split the train into training and validation sets
+# The function createDataPartition can be used to create balanced splits of the data. This will be used in the first modeling, but we will be looking into R package caret createTimeSlices,to resample times series data, later once we can find an example.
+inTrain <- createDataPartition(train$logduration,p=0.8,list=FALSE,times=1) 
+# inTrain <- createTimeSlices(trainsample$logduration,initialWindow=5,horizon=2,fixedWindow=FALSE)
+training <- train[inTrain,]
+valid <- train[-inTrain,]
+```
+
+3.5. **DATA MATRIX**
+
+```{r matrix}
+# One method to convert the dataframe to a sparse matrix is using the R package Matrix. This will transform all categorical features but column logduration, which is our outcome, to binary values."sparse.model.matrix" is the command and all other inputs inside parentheses are parameters. In a sparse matrix, the cells containing 0 are not stored in memory. Therefore, in a dataset mainly made of 0, memory usage is reduced.
+# The parameter "response" says that this statement should ignore "response" variable.
+# "-1" removes an extra column which this command creates as the first column.
+# sparse_matrix <- sparse.model.matrix(logduration~.-1, 
+#                data = training[-training$trip_duration,])
+# ts_sparse_matrix <- sparse.model.matrix(logduration~.-1, 
+#                data = testing) # no trip_duration in test
+
+# Target numeric outcome y (label) on training set
+y = training$logduration
+
+# To use advanced features xgboost, as recommended, we'll use xgb.DMatrix function to convert a matrix or a dgCMatrix into a xgb.DMatrix object, which contains a list with dgCMatrix data  and numeric label: 
+
+dtrain <- xgb.DMatrix(data = data.matrix(select(training, -logduration, -trip_duration)),
+                 label = y)
+dvalid <- xgb.DMatrix(data = data.matrix(select(valid, -logduration, -trip_duration)), 
+                      label = valid$logduration)
+dtest <- xgb.DMatrix(data.matrix(test))
+# We use watchlist parameter to measure the progress with a second dataset which is already classified. 
+watchlist <- list(train=dtrain, test=dvalid)
+# Check that dtest has the same number of rows as the original test file, 625,134 rows
+nrow(dtest)
+```
+
+
+3.6. **MODEL PARAMETERS**
+
+The following are parameters available for XGBoost R package:
+
+**General parameters**
+- booster
+We will run models for boosters gblinear and gbtree. 
+nthread [default=maximum cores available] silent[default=0] to not see the running messages
+
+**Booster parameters**
+For each of these boosters, there are booster parameters, these are common between the two:
+
+- nrounds - Observe the number chosen for nrounds for any overfitting using CV. the max number of iterations.
+- alpha[default=1] and lambda [default=0] to control regularisation
+
+Parameters for Tree Booster also include:
+- eta[default=0.3][range: (0,1)] controls the learning rate
+- max_depth[default=6][range: (0,Inf)] controls the depth of the tree- tuned using CV
+- min_child_weight[default=1][range:(0,Inf)] In simple words, it blocks the potential feature interactions to prevent overfitting. Should be tuned using CV.
+- subsample[default=1][range: (0,1)] controls the number of samples (observations) supplied to a tree.
+- colsample_bytree[default=1][range: (0,1)]control the number of features (variables) supplied to a tree
+
+**Learning Task Parameters**
+
+These parameters specify methods for the loss function and model evaluation. In addition to the parameters listed below, you are free to use a customized objective / evaluation function.
+
+Objective[default=reg:linear]
+
+eval_metric [no default, depends on objective selected]
+These metrics are used to evaluate a model's accuracy on validation data. For regression, default metric is RMSE.
+
+One of the simplest way to see the training progress in XGBoost is to set the verbose option to # verbose = 0, no message but use print.every.n,verbose = 1, print evaluation metric, verbose = 2, also print information about the tree.
+
+3.7. **CROSS VALIDATION**
+
+Using the inbuilt xgb.cv function for k-fold cross validation, let's calculate the best nrounds for this model. In addition, this function also returns CV error, which is an estimate of test error.
+
+```{r xgbcv}
+# Configure parallel processings
+# parallelStartSocket(cpus = detectCores())
+# set random seed, for reproducibility 
+# set.seed(1234)
+# Using booster gblinear, with a large nround=400 
+ xgbcv <- xgb.cv(params = list(booster = "gblinear",
+                objective = "reg:linear",
+                lambda=0,
+                alpha=1,
+                eta = 0.3, 
+                gamma = 0,
+                max_depth = 6,
+                min_child_weight = 1,
+                subsample = 1,
+                colsample_bytree = 1), 
+                data = dtrain, 
+                label=y,
+                nrounds = 400,
+                nfold = 5, 
+                showsd = T, 
+                stratified = T, 
+                 print.every.n = 20, # when verbose =0
+                 early.stop.round = 20, 
+                 maximize = F,
+                 verbose=0)
+#  nround best iteration is:
+ bestiteration <- xgbcv$best_iteration
+bestiteration <-400
+# xgbcv gblinear minimum train RMSE mean
+ min(xgbcv$evaluation_log$train_rmse_mean)
+# xgbcv gblinear minimum test RMSE mean
+ min(xgbcv$evaluation_log$test_rmse_mean)
+```
+
+
+3.8. **MODEL TRAINING**
+
+Lets use the basic XGBoost function with the nrounds from the best iteration determined by the xgb.cv function above, for both boosters gblinear and gbtree with default parameter settings.
+
+```{r xgboost}
+# Configure parallel processings
+parallelStartSocket(cpus = detectCores())
+# set random seed, for reproducibility 
+set.seed(1234)
+bstlinear <- xgboost(data=dtrain, 
+                label=y,
+                booster = "gblinear",
+                objective = "reg:linear",
+                nrounds = bestiteration,
+                lambda=0,
+                alpha=1,
+                verbose = 0)
+bsttree <- xgboost( data=dtrain, 
+                label=y,
+                params = list(booster = "gbtree",
+                objective = "reg:linear",
+                lambda=0,
+                alpha=1,
+                eta = 0.3, 
+                gamma = 0,
+                max_depth = 6,
+                min_child_weight = 1,
+                subsample = 1,
+                colsample_bytree = 1),
+                nrounds = bestiteration,
+                verbose = 0)
+# bstlinear gblinear minimum RMSE
+min(bstlinear$evaluation_log$train_rmse)
+# bsttree gbtree minimum RMSE
+min(bsttree$evaluation_log$train_rms)
+```
+Tabulate the cross-validation's predictions of the model.
+
+```{r cvpreds}
+# get CV's prediction decoding
+xgbpredlinear <- predict (bstlinear,dvalid)
+xgbpredtree <- predict (bsttree, dvalid)
+# Evaluation using RMSE of linear model, R-Squared of the models
+postResample(xgbpredlinear,valid$logduration)
+# Evaluation using RMSE of tree model, R-Squared of the models
+postResample(xgbpredtree,valid$logduration)
+```
+
+It appears that the gbtree booster provides a much lower RMSE than the gblinear booster, therefore select the gbtree booster.
+
+One way to measure progress in learning of a model is using xgb.train, providing a second dataset already classified. Therefore it can learn on the first dataset and test its model on the second one. Metrics are measured after each round during the learning.
+
+```{r xgb.train}
+# Parameters for xgb.train, which can be tuned in future iterations.
+params <- list(colsample_bytree = 1, #variables per tree 
+                    subsample = 1, 
+                    booster = "gbtree",
+                    max_depth = 6,             
+                    min_child_weight = 1,#added to list
+                    eta = 0.3, #shrinkage
+                    eval_metric = "rmse", 
+                    objective = "reg:linear",
+                    lambda=0, 
+                    alpha=1,
+                    gamma = 0)
+
+# Configure parallel processings
+parallelStartSocket(cpus = detectCores())
+# set random seed, for reproducibility 
+set.seed(1234)
+# Train model with gbtree and parames above
+bst <- xgb.train(params = params,
+                   data = dtrain,
+                   print_every_n = 20, # visualise the error minimising with each round
+                   watchlist = watchlist,
+                   nrounds = bestiteration,
+                   verbose = 1)
+```
+
+
+```{r predictions validation}
+# Calculate predictions for XGBoost
+predictvalid <- predict(bst,dvalid)
+# Evaluation of "test-rmse" RMSE, R-Squared of the models
+postResample(predictvalid,valid$logduration)
+```
+The train-rmse is lower than the test-rmse (validation set) therefore the model may be overfitting.
+
+3.9. **IMPORTANCE MATRIX**
+
+Let's take a look at the importance matrix plot which will give a visualisation of the features for further feature engineering.
+
+```{r xgboost matrix}
+# Get the trained model
+model = xgb.dump(bst, with.stats=TRUE)
+# Get the feature real names
+names = dimnames(dtrain)[[2]]
+# Compute feature importance matrix
+importance_matrix = xgb.importance(feature_names=names, model=bst)
+head(importance_matrix)
+# Plot the importance matrix
+gp = xgb.plot.importance(importance_matrix)
+# Print the the importance matrix data
+print(gp)
+# Plot a graph using xgb.plot.importance
+xgb.plot.importance(importance_matrix[1:10,])
+```
+
+## Part 4: Predictions
+
+Make a prediction on the test set and create submission file to be loaded to Kaggle. Once loaded Kaggle will provide a score as RMSLE (Root Mean Squared Logarithmic Error) on the _trip_duration_ predictions.
+
+```{r predictions test}
+# Create a prediction file and convert the log of the duration back to duration in seconds.
+predictxgb<- predict(bst,dtest)
+pred <- test_id %>%
+   mutate(trip_duration = exp(predictxgb) - 1)
+```
+
+
+
+```{r subfile}
+# Create Kaggle Submission File
+my_solution <- data.frame(Id = test_id, trip_duration = pred$trip_duration)
+# Check the number of rows in the solution file is 625,134
+nrow(my_solution)
+# Write solution to file submissionFile1.csv
+write.csv(my_solution, file = "submissionFile1.csv", quote=F, row.names=F)
+```
+
