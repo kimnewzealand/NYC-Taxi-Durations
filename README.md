@@ -1,5 +1,9 @@
 # NYC-Taxi-Durations
 
-NYC Taxi Kaggle competition Exploratory data analysis and XGBoost.  
+NYC Taxi Kaggle competition 
 
-Also see https://kimnewzealand.github.io/NYC-Taxi-Durations/ for html 
+This repo contains two R markdown documents:
+
+- Exploratory data analysis 
+- Model training with XGBoost.  
+
